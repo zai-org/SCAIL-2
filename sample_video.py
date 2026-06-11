@@ -436,10 +436,6 @@ def sampling_main(args, model_cls):
                         pose_sam_video = F.interpolate(pose_sam_video, scale_factor=0.5, mode='bilinear', align_corners=False)  # 0.5x, same as smpl_downsample
                         ref_sam = load_image_to_tensor_chw_normalized(ref_mask_path)
                         ref_sam = resize_for_rectangle_crop(ref_sam, [target_H, target_W], reshape_mode="center")  # 1 c h w, -1-1
-                        if ref_mask_flag:
-                            # Reverse black areas to white, matching VAE preprocessing
-                            black_mask = (ref_sam.max(dim=1, keepdim=True).values < -0.5)  # [1, 1, H, W]
-                            ref_sam = ref_sam.masked_fill(black_mask, 1.0)
                     else:
                         pose_sam_video = None
                         ref_sam = None
