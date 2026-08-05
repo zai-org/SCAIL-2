@@ -291,7 +291,7 @@ class SATVideoDiffusionEngine(nn.Module):
                 latent_ref_mask = latent_ref_mask.permute(0, 2, 1, 3, 4).contiguous()
 
                 if self.pose_dropout > 0:
-                    null_smpl = torch.load(f"/workspace/yanwenhao/cogvideo_vae_inference/zero_pose_latent_{smpl_render.shape[1]}_{smpl_render.shape[3]}_{smpl_render.shape[4]}.pt").to(self.device).to(self.dtype)
+                    null_smpl = torch.load(f"latents/zero_pose_latent_{smpl_render.shape[1]}_{smpl_render.shape[3]}_{smpl_render.shape[4]}.pt").to(self.device).to(self.dtype)
                 else:
                     null_smpl = None
                 null_noisy_mask = torch.zeros(smpl_render.shape[1], latent_ref_mask.shape[2], latent_ref_mask.shape[3], latent_ref_mask.shape[4], device=self.device, dtype=self.dtype)  # (T_smpl, C=28, H, W)
@@ -358,9 +358,6 @@ class SATVideoDiffusionEngine(nn.Module):
             **kwargs,
     ):
         randn = torch.randn(batch_size, *shape).to(torch.float32).to(self.device)
-        #debug !!!!!!!
-        # breakpoint()
-        # randn = torch.load('/workspace/ckpt/tjy/glm-train-dev/noise.pt').to(self.device).permute(0, 2, 1, 3, 4).contiguous()
 
         if hasattr(self, "seeded_noise"):
             randn = self.seeded_noise(randn)

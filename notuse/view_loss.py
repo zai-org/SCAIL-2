@@ -99,12 +99,6 @@ def sampling_main(args, model_cls):
     latest_iter = get_latest_checkpoint(args.load)
     
 
-    # dataset = MultiMetaWebDataset(idx=0, image_size=256, interpolation=1, 
-    #                               ds_infos=[{'path': '', 'include_dirs': '/mnt/shared/img_datasets/clay1b_dataset/laion2ben_merged2_cleaned_wds/part-00000', 
-    #                                          'filters': [{'key': 'aesthetic_score_laion_v2', 'dir': '/mnt/shared/img_datasets/clay1b_dataset/laion2ben_merged2_cleaned_wds', 'dir_level': 2, 'file_postfix': '.meta.jsonl', 'val': 5, 'greater': True}],
-    #                                          'extra_texts': 1
-    #                                         }])
-    
     data_class = get_obj_from_str(args.data_config["target"])
     create_dataset_function = partial(data_class.create_dataset_function, **args.data_config["params"])
     train_data, val_data, test_data = make_loaders(args, create_dataset_function)
@@ -147,7 +141,8 @@ def sampling_main(args, model_cls):
                 
                 noise = torch.randn_like(x)
                 if isinstance(model.loss_fn, VideoDiffusionLoss):
-                    alphas_cumprod_sqrt_schedule = torch.load('/workspace/ckpt/tjy/sat_sdxl/shift-1.0.pt')
+                    raise NotImplementedError()
+                    alphas_cumprod_sqrt_schedule = torch.load('/path/to/sat_sdxl/shift-1.0.pt')
                     alphas_cumprod_sqrt = alphas_cumprod_sqrt_schedule[[step]*x.shape[0]].to(x.device)
                     additional_model_inputs['idx'] = (alphas_cumprod_sqrt - model.loss_fn.sigma_sampler.sigmas.to(x.device)[:,None]).abs().argmin(dim=0)
 

@@ -504,7 +504,7 @@ def sampling_main(args, model_cls):
                     use_null_pose = False  # set True to replace pose with null (zero) pose, consistent with training pose dropout
                     if use_null_pose:
                         T_l, H_l, W_l = smpl_render_latent.shape[1], smpl_render_latent.shape[3], smpl_render_latent.shape[4]
-                        null_smpl = torch.load(f"/workspace/yanwenhao/cogvideo_vae_inference/zero_pose_latent_{T_l}_{H_l}_{W_l}.pt").to('cuda').to(torch.bfloat16)
+                        null_smpl = torch.load(f"latents/cogvideo_vae_inference/zero_pose_latent_{T_l}_{H_l}_{W_l}.pt").to('cuda').to(torch.bfloat16)
                         smpl_render_latent = null_smpl.unsqueeze(0).expand_as(smpl_render_latent).contiguous()
                     if "smpl_downsample_mask" in args.representation:
                         # sam_segment: (T, C=3, H/2, W/2)，已 2x 预下采样，additional_spatial_downsample=1

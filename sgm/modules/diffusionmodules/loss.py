@@ -602,8 +602,6 @@ class RFLossAmp(StandardDiffusionLoss):
                 batch["concat_images"] = torch.chunk(batch["concat_images"], sp_size, dim=chunk_dim)[sp_rank]
             if 'ref_concat' in batch.keys():
                 batch['ref_concat'] = torch.chunk(batch['ref_concat'], sp_size, dim=chunk_dim)[sp_rank]
-            if "concat_pose" in batch.keys():
-                batch['concat_pose'] = torch.chunk(batch['concat_pose'], sp_size, dim=chunk_dim)[sp_rank]
             if "concat_smpl_render" in batch.keys():
                 batch['concat_smpl_render'] = torch.chunk(batch['concat_smpl_render'], sp_size, dim=chunk_dim)[sp_rank]
             if "concat_cheek_hands" in batch.keys():
@@ -615,10 +613,6 @@ class RFLossAmp(StandardDiffusionLoss):
             additional_model_inputs["image_clip_features"] = batch["image_clip_features"]
         if 'ref_concat' in batch.keys():
             additional_model_inputs['ref_concat'] = batch['ref_concat']
-        if 'pose_downsample' in batch.keys():
-            additional_model_inputs['pose_downsample'] = batch['pose_downsample']
-        if 'concat_pose' in batch.keys():
-            additional_model_inputs['concat_pose'] = batch['concat_pose']
         if 'concat_smpl_render' in batch.keys():
             additional_model_inputs['concat_smpl_render'] = batch['concat_smpl_render']
         if 'concat_cheek_hands' in batch.keys():
@@ -702,31 +696,37 @@ class RFLoss(StandardDiffusionLoss):
                 batch["concat_images"] = torch.chunk(batch["concat_images"], sp_size, dim=chunk_dim)[sp_rank]
             if 'ref_concat' in batch.keys():
                 batch['ref_concat'] = torch.chunk(batch['ref_concat'], sp_size, dim=chunk_dim)[sp_rank]
-            if "concat_pose" in batch.keys():
-                batch['concat_pose'] = torch.chunk(batch['concat_pose'], sp_size, dim=chunk_dim)[sp_rank]
             if "concat_smpl_render" in batch.keys():
                 batch['concat_smpl_render'] = torch.chunk(batch['concat_smpl_render'], sp_size, dim=chunk_dim)[sp_rank]
+            if "concat_latent_sam" in batch.keys():
+                batch['concat_latent_sam'] = torch.chunk(batch['concat_latent_sam'], sp_size, dim=chunk_dim)[sp_rank]
+            if "concat_latent_ref_mask" in batch.keys():
+                batch['concat_latent_ref_mask'] = torch.chunk(batch['concat_latent_ref_mask'], sp_size, dim=chunk_dim)[sp_rank]
             if "concat_cheek_hands" in batch.keys():
                 batch['concat_cheek_hands'] = torch.chunk(batch['concat_cheek_hands'], sp_size, dim=chunk_dim)[sp_rank]
             if "history_mask" in batch.keys():
                 batch['history_mask'] = torch.chunk(batch['history_mask'], sp_size, dim=chunk_dim)[sp_rank]
-        
+            if "latent_ocr_mask" in batch.keys():
+                batch['latent_ocr_mask'] = torch.chunk(batch['latent_ocr_mask'], sp_size, dim=chunk_dim)[sp_rank]
+
         if "concat_images" in batch.keys():
             additional_model_inputs["concat_images"] = batch["concat_images"]
         if "image_clip_features" in batch.keys():
             additional_model_inputs["image_clip_features"] = batch["image_clip_features"]
         if 'ref_concat' in batch.keys():
             additional_model_inputs['ref_concat'] = batch['ref_concat']
-        if 'pose_downsample' in batch.keys():
-            additional_model_inputs['pose_downsample'] = batch['pose_downsample']
-        if 'concat_pose' in batch.keys():
-            additional_model_inputs['concat_pose'] = batch['concat_pose']
         if 'concat_smpl_render' in batch.keys():
             additional_model_inputs['concat_smpl_render'] = batch['concat_smpl_render']
+        if "concat_latent_sam" in batch.keys():
+            additional_model_inputs['concat_latent_sam'] = batch['concat_latent_sam']
+        if "concat_latent_ref_mask" in batch.keys():
+            additional_model_inputs['concat_latent_ref_mask'] = batch['concat_latent_ref_mask']
         if 'concat_cheek_hands' in batch.keys():
             additional_model_inputs['concat_cheek_hands'] = batch['concat_cheek_hands']
         if 'history_mask' in batch.keys():
             additional_model_inputs['history_mask'] = batch['history_mask']
+        if 'ref_mask_flag' in batch.keys():
+            additional_model_inputs['ref_mask_flag'] = batch['ref_mask_flag']
 
         history_mask = batch['history_mask']  # b t 4 h w
         # 将history_mask从[b, t, 4, h, w]扩展到[b, t, c, h, w]以匹配noise和input的维度
@@ -734,18 +734,22 @@ class RFLoss(StandardDiffusionLoss):
         c = input.shape[2]
         history_mask_expanded = history_mask[:, :, :1, :, :].expand(-1, -1, c, -1, -1)  # b t c h w
         
-        # 对历史帧区域（history_mask=1）的noise置0，不给历史帧加噪
-        noise_masked = noise * (1 - history_mask_expanded)
-        
-        # 计算noised_input，历史帧保持原始input，非历史帧加噪
-        noised_input = input.float() * append_dims(1 - sigma, input.ndim) + noise_masked * append_dims(sigma, input.ndim)
+        # 计算noised_input
+        # 对于生成帧（history_mask=0）: noised_input = (1-sigma)*input + sigma*noise
+        # 对于历史帧（history_mask=1）: noised_input = input（保持清晰，不受sigma影响）
+        noised_input_generated = input.float() * append_dims(1 - sigma, input.ndim) + noise * append_dims(sigma, input.ndim)
+        noised_input = history_mask_expanded * input.float() + (1 - history_mask_expanded) * noised_input_generated
 
         model_output = denoiser(
             network, noised_input, sigma, cond, **additional_model_inputs
         )
 
-        # 只对非历史帧计算loss，历史帧的loss权重为0
-        loss_mask = 1 - history_mask_expanded
+        latent_ocr_mask = batch["latent_ocr_mask"]  # shape和latent_hands_mask/latent_faces_mask一样，是和latent对齐的，ocr部分为1
+        latent_ocr_mask_expanded = latent_ocr_mask[:, :, :1, :, :].expand(-1, -1, c, -1, -1)  # b t c h w
+
+        # 只对非历史帧、非ocr区域计算loss
+        loss_mask = (1 - history_mask_expanded) * (1 - latent_ocr_mask_expanded)
+        # loss_mask = 1 - history_mask_expanded
         return self.get_loss(model_output, noise - input, loss_mask)
     
 
