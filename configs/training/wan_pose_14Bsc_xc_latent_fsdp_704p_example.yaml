@@ -1,0 +1,78 @@
+args:
+  # FSDP2 fine-tuning example for the shared dit_video_crossattn_sc_xc.py path.
+  # Set --load from the launch script, or edit this file for your local checkpoint.
+  lr_decay_style: cosine
+  checkpoint_activations: True
+  only_log_video_latents: False
+  model_parallel_size: 1
+  wandb: False
+  mode: finetune
+  no_load_rng: True
+  train_iters: 1000
+  eval_iters: 1
+  eval_interval: 100000
+  save: outputs/checkpoints
+  empty_cache_interval: 1
+  save_interval: 100
+  log_interval: 5
+  train_data: ["train_0"]
+  valid_data: ["valid_0"]
+  train_data_weights: [1]
+  split: 1,0,0
+  iterable_dataset: True
+  iterable_dataset_eval: True
+  num_workers: 4
+  num_multi_query_heads: 8
+  force_train: True
+  fixed_resolution: False
+  batch_size: 1
+  sequence_parallel_size: 2
+  fsdp_gradient_accumulation_steps: 4
+  experiment_name: pose-wan-14bsc-fsdp-704p-example
+  wandb_project_name: pose-wan-14bsc-fsdp-704p-example
+
+  fsdp2: True
+  save_optimizer: False
+  fsdp2_config:
+    mixed_precision: True
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    sharding_strategy: full_shard
+    auto_wrap: True
+    wrap_patterns: ['blocks', 'layers']
+    min_params_to_wrap: 10000
+    reshard_after_forward: True
+    offload_params: False
+    max_grad_norm: 0.1
+
+    optimizer: AdamW
+    optimizer_params:
+      # Keep this at 1 because SAT's AnnealingLR owns the effective LR.
+      lr: 1
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      weight_decay: 1e-4
+      state_lr: 2e-6
+
+data:
+  target: data_video.IVBucketDataset
+  params:
+    batch_size: 1
+    eval_batch_size: 1
+    video_ratio: 1
+    image_size_buckets: [[64, 112], [112, 64], [88, 160], [160, 88]]
+    video_frame_batch_buckets: [[21, 1], [17, 1]]
+    image_frame_batch_buckets: [[1, 25]]
+    bucket_helper_type: pose_latent
+    modify_prompt: True
+    shuffle_buffer: 1
+    image_dataset_configs: []
+    video_ds_weights: [1]
+    video_dataset_configs:
+      - target: data_video.VideoPoseLatentDataset
+        params:
+          fps: 16
+          meta_names: ['caption', 'duration', 'fps', 'optical_flow_score', 'long_caption', 'long_captionv3', 'long_caption_v3', 'aesthetic_score', 'width', 'height', 'motion_indices', 'ref_image_indices', 'random_slow_play']
+          path: ""
+          include_dirs:
+            - ${oc.env:SCAIL2_POSE_LATENT_TRAIN_DIR,examples/data/pose_latent_704p_train}

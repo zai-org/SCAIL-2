@@ -6,7 +6,7 @@ model:
   latent_input: true
   noised_image_input: true
   use_pose: true
-  pose_dropout: 0.045
+  pose_dropout: 0
   log_keys:
     - txt
   

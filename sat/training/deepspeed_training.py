@@ -22,9 +22,21 @@ import torch
 from collections import defaultdict
 from datetime import datetime
 from contextlib import ExitStack
+from packaging import version
 
 import torch.distributed as dist
 import deepspeed
+try:
+    from torch.distributed._tensor import init_device_mesh
+    if version.parse(torch.__version__.split('+')[0]) < version.parse('2.6'):
+        from torch.distributed._composable.fsdp import fully_shard, CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy, register_fsdp_forward_method
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions, set_model_state_dict, set_optimizer_state_dict
+    else:
+        from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy, register_fsdp_forward_method, FullyShardedDataParallel
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions, set_model_state_dict, set_optimizer_state_dict
+    HAVE_FSDP2 = True
+except ImportError:
+    HAVE_FSDP2 = False
 import wandb
 
 from .learning_rates import AnnealingLR
@@ -46,6 +58,88 @@ try:
     import wandb
 except ImportError:
     print("wandb not installed.")
+import warnings
+import functools
+
+_fsdp2_enabled = False
+
+def clip_grad_norm_fsdp2(
+    parameters,
+    max_norm: float,
+    norm_type: float = 2.0,
+    process_group=None,
+    cpu_offload: bool = False,
+) -> torch.Tensor:
+    """Clips gradient norm of an iterable of parameters.
+
+    This is adapted from fsdp clip_grad_norm and also takes into
+    account gradient averaging with DDP.
+    """
+    grads = []
+    grads_dtypes = []
+    sharded_grads = []
+    nonsharded_grads = []
+
+    for p in parameters:
+        grad = p.grad
+        if grad is None:
+            continue
+        grads_dtypes.append(grad.dtype)
+        if hasattr(grad, "to_local"):
+            grad_local = grad.to_local()
+            sharded_grads.append(grad_local.view(-1).float())
+        else:
+            nonsharded_grads.append(grad.view(-1).float())
+        grads.append(grad)
+
+    zero_tensor = torch.tensor(0.0, device=grads[0].device) if grads else torch.tensor(0.0)
+    if norm_type == math.inf:
+        local_sharded_norm = (
+            torch.cat(sharded_grads).abs().max() if sharded_grads else zero_tensor
+        )
+        local_nonsharded_norm = (
+            torch.cat(nonsharded_grads).abs().max() if nonsharded_grads else zero_tensor
+        )
+    else:
+        local_sharded_norm = (
+            torch.norm(torch.cat(sharded_grads), norm_type) if sharded_grads else zero_tensor
+        )
+        local_nonsharded_norm = (
+            torch.norm(torch.cat(nonsharded_grads), norm_type) if nonsharded_grads else zero_tensor
+        )
+
+    pg = process_group if process_group is not None else dist.group.WORLD
+    if norm_type == math.inf:
+        total_norm = local_sharded_norm.clone()
+        dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pg)
+        total_norm = torch.maximum(total_norm, local_nonsharded_norm)
+    else:
+        sharded_sq = local_sharded_norm.pow(norm_type)
+        dist.all_reduce(sharded_sq, op=dist.ReduceOp.SUM, group=pg)
+        total_norm = sharded_sq
+        if nonsharded_grads:
+            total_norm += local_nonsharded_norm.pow(norm_type)
+        total_norm = total_norm ** (1.0 / norm_type)
+
+    if cpu_offload:
+        total_norm = total_norm.cpu()
+
+    # clip
+    clip_coef = max_norm / (total_norm + 1e-6)
+    clip_coef_clamped = min(clip_coef, 1.0)
+    for grad in grads:
+        if hasattr(grad, "to_local"):
+            grad_local = grad.to_local()
+            grad_local.mul_(clip_coef_clamped)
+        else:
+            grad.mul_(clip_coef_clamped)
+
+    # Promote dtype
+    if len(grads_dtypes) == 0:
+        warnings.warn("Called distributed FSDP2 clip_grad_norm with no gradients!")
+        return total_norm
+    total_norm_dtype = functools.reduce(torch.promote_types, grads_dtypes)
+    return total_norm.to(total_norm_dtype)
 
 def training_main(args, model_cls, forward_step_function, create_dataset_function, handle_metrics_function=None, init_function=None, collate_fn=None, forward_step_eval=None):
     """Main training program."""
@@ -93,6 +187,9 @@ def training_main(args, model_cls, forward_step_function, create_dataset_functio
         for name, buffer in model.named_buffers():
             if buffer.device != correct_device:
                 buffer.data = buffer.data.to(correct_device)
+    if args.fsdp2:
+        global _fsdp2_enabled
+        _fsdp2_enabled = True
 
     # Config model IO
     if args.resume_save:
@@ -109,14 +206,15 @@ def training_main(args, model_cls, forward_step_function, create_dataset_functio
         if retry_iteration > 0:
             args.load = args.resume_save    # overload load path if resume_save is set and there is valid checkpoint in the path
 
-    if args.load is not None:
+    if args.load is not None and not args.fsdp2:
+        # FSDP2 loads after fully_shard is applied in setup_model_untrainable_params_and_optimizer.
         args.iteration = load_checkpoint(model, args)
         # if we don't load optim_states, filelock is no more needed.
         # with FileLock("/root/checkpoint_lock", timeout=-1):
         #     args.iteration = load_checkpoint(model, optimizer, args)
     else:
         args.iteration = 0
-    
+
     if args.resume_save:
         args.save = args.resume_save        # overload save path if resume_save is set
     elif args.save:
@@ -146,11 +244,13 @@ def training_main(args, model_cls, forward_step_function, create_dataset_functio
     if hooks['init_function'] is not None:
         hooks['init_function'](args, model)
 
-    # training 
+    # training
     iteration = 0
     if args.train_iters > 0:
         # Optimization related things
-        model, optimizer = setup_model_untrainable_params_and_optimizer(args, model)
+        model, optimizer, iteration = setup_model_untrainable_params_and_optimizer(args, model)
+        if iteration > 0:
+            args.iteration = iteration
 
         # initialize lr scheduler
         lr_scheduler = get_learning_rate_scheduler(optimizer, args.iteration, args)
@@ -297,25 +397,22 @@ def check_param_sync(args, model):
 
 def setup_model_untrainable_params_and_optimizer(args, model, config_params=None):
     """Setup model and optimizer."""
-
+    iteration = 0 #setting for fsdp2 training states reset
     if hasattr(model, 'disable_untrainable_params'):
         model.disable_untrainable_params() # mark trainable params
 
-    param_groups = get_optimizer_param_groups(model)
-
-    # sync initialized parameters
-    sync_params_across_ranks(args, model)
-
     if args.train_data is not None:
         if args.deepspeed:
-            from packaging import version
+            param_groups = get_optimizer_param_groups(model)
+            # sync initialized parameters
+            sync_params_across_ranks(args, model)
             print_rank0("DeepSpeed is enabled.", level='DEBUG')
             # checking optimizer
             optimizer_name = args.deepspeed_config.get('optimizer',{}).get('type', '')
             if optimizer_name.startswith('sat.'):
                 from importlib import import_module
                 from functools import partial
-                # split and import 
+                # split and import
                 optimizer_callable = getattr(import_module(optimizer_name.rsplit('.', maxsplit=1)[0]), optimizer_name.split('.')[-1])
                 optimizer_callable = partial(optimizer_callable, **args.deepspeed_config.get('optimizer', {}).get('params', {}))
                 print_rank0(f'Using optimizer {optimizer_name} from sat.')
@@ -334,12 +431,153 @@ def setup_model_untrainable_params_and_optimizer(args, model, config_params=None
                     if version.parse(deepspeed.version) < version.parse("0.9.0")
                     else None
             )
+        elif hasattr(args, 'fsdp2') and args.fsdp2:
+            if not HAVE_FSDP2:
+                raise ImportError("FSDP2 is not available. Please upgrade to PyTorch >= 2.5")
+            print_rank0("FSDP2 is enabled.", level='DEBUG')
+            # Setup FSDP2 configuration
+            fsdp_config = getattr(args, 'fsdp2_config', {})
+            # Mixed precision policy
+            mp_policy = None
+            if fsdp_config.get('mixed_precision', False):
+                param_dtype = getattr(torch, fsdp_config.get('param_dtype', 'float32'))
+                reduce_dtype = getattr(torch, fsdp_config.get('reduce_dtype', 'float32'))
+                mp_policy = MixedPrecisionPolicy(
+                    param_dtype=param_dtype,
+                    reduce_dtype=reduce_dtype,
+                )
+            # print_rank0(f"Using mp_policy {mp_policy}")
+            offload_policy = OffloadPolicy()
+            if fsdp_config.get('offload_params', False):
+                offload_policy = CPUOffloadPolicy(pin_memory=True)
+            # Apply fully_shard to submodules first if specified
+            if fsdp_config.get('auto_wrap', True):
+                import torch.nn as nn
+                def is_container(module):
+                    return isinstance(module, (nn.ModuleList, nn.ModuleDict, nn.Sequential, nn.ParameterList))
+                def recursive_fully_shard(module, prefix, wrap_patterns, min_params, fully_shard, mp_policy, offload_policy, fsdp_config, is_container):
+                    for name, child in module.named_children():
+                        child_prefix = f"{prefix}.{name}" if prefix else name
+                        recursive_fully_shard(
+                            child, child_prefix, wrap_patterns, min_params, fully_shard,
+                            mp_policy, offload_policy, fsdp_config, is_container
+                        )
+                    should_wrap = any(pattern in prefix.lower() for pattern in wrap_patterns)
+                    if is_container(module):
+                        return
+                    num_params = sum(p.numel() for p in module.parameters(recurse=False))
+                    if should_wrap and num_params >= min_params:
+                        fully_shard(
+                            module,
+                            # mesh=fsdp_mesh,
+                            mp_policy=mp_policy,
+                            offload_policy=offload_policy,
+                            reshard_after_forward=fsdp_config.get('reshard_after_forward', True)
+                        )
+                        # print_rank0(f"FSDP2: Wrapped module {prefix} with {num_params / 1e6:.2f}M parameters")
+                wrap_patterns = fsdp_config.get('wrap_patterns', ['block', 'layer', 'transformer'])
+                min_params = fsdp_config.get('min_params_to_wrap', 1e6)
+                recursive_fully_shard(
+                    model, '', wrap_patterns, min_params, fully_shard,
+                    mp_policy, offload_policy, fsdp_config, is_container
+                )
+             # Wrap the entire model
+            model.model.diffusion_model = fully_shard(
+                model.model.diffusion_model ,
+                # mesh=fsdp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                reshard_after_forward=fsdp_config.get('reshard_after_forward', True)
+            )
+            model.conditioner = fully_shard(
+                model.conditioner,
+                # mesh=fsdp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                reshard_after_forward=fsdp_config.get('reshard_after_forward', True)
+            )
+            # Setup optimizer for FSDP2
+            optimizer_class_name = fsdp_config.get('optimizer', 'AdamW')
+            optimizer_params = fsdp_config.get('optimizer_params')
+            optimizer = torch.optim.AdamW(
+                # [param for param in model.parameters() if param.requires_grad],
+                get_optimizer_param_groups(model),
+                lr=optimizer_params['lr'],
+                betas=(optimizer_params['betas'][0], optimizer_params['betas'][1]),
+                weight_decay=optimizer_params['weight_decay']
+            )
+
+            if args.load is not None:
+                load_path = args.load
+                from sat.training.model_io import get_checkpoint_iteration, get_checkpoint_name
+                iteration, release, success = get_checkpoint_iteration(load_path)
+                checkpoint_name = os.path.join(load_path, str(iteration), f'fsdp2_rank_0000_checkpoint.pt')
+                if not os.path.exists(checkpoint_name):
+                    # Fallback to regular checkpoint for compatibility
+                    checkpoint_name = get_checkpoint_name(load_path, iteration, release)
+                    print_rank0(f'FSDP2 checkpoint not found, trying regular checkpoint: {checkpoint_name}')
+                sd = torch.load(checkpoint_name, map_location='cpu')
+                print_rank0(f'Loading checkpoint {args.load}')
+                if hasattr(model, 'module'):
+                    module = model.module
+                else: # inference without deepspeed or using FSDP2
+                    module = model
+                set_model_state_dict(
+                    model=module,
+                    model_state_dict=sd['module'],
+                    options=StateDictOptions(
+                        full_state_dict=True,
+                        broadcast_from_rank0=False, # TODO: upgrade
+                    ),
+                )
+                if args.mode == 'finetune' and not args.resume_save:
+                    iteration = 0
+                elif args.mode == 'pretrain' and not args.no_load_rng: # rng states.
+                    try:
+                        random.setstate(sd['random_rng_state'])
+                        np.random.set_state(sd['np_rng_state'])
+                        torch.set_rng_state(sd['torch_rng_state'])
+                        torch.cuda.set_rng_state(sd['cuda_rng_state'])
+                        # mpu.get_cuda_rng_tracker().set_states(sd['rng_tracker_states'])
+
+                        #set optimizer state dict
+                        set_optimizer_state_dict(
+                            model=module,
+                            optimizers=optimizer,
+                            optim_state_dict=sd['optimizer'],
+                            options=StateDictOptions(
+                                full_state_dict=True,
+                                broadcast_from_rank0=False,
+                            ),
+                            )
+                    except KeyError:
+                        print_rank0('Unable to load optimizer from checkpoint {}, exiting. '
+                                    'Specify --no-load-rng or --finetune to prevent '
+                                    'attempting to load the random '
+                                    'state.'.format(checkpoint_name))
+                        exit()
+                elif args.mode == 'inference':
+                    module.eval()
+
+                if mpu.get_data_parallel_rank() == 0:
+                    print_all('> successfully loaded {}'.format(checkpoint_name))
+                del sd
+            # sharded parameters are float32
+            for param in model.model.diffusion_model.parameters():
+                assert param.dtype == torch.float32
+
+            # unsharded parameters are bfloat16
+            model.model.diffusion_model.unshard()
+            for param in model.model.diffusion_model.parameters(recurse=False):
+                assert param.dtype == torch.bfloat16
+            model.model.diffusion_model.reshard()
+
         else:
             raise ValueError('Currently, we only support training with deepspeed.')
     else:
         optimizer = None
 
-    return model, optimizer
+    return model, optimizer, iteration
 
 
 def add_param_by_lr(dic, p, no_weight_decay=False):
@@ -546,7 +784,7 @@ def train_step(data_iterator, model, optimizer, lr_scheduler,
         hooks = {}
     lm_loss_total, metrics_total, count, metrics_count = 0.0, {}, 0, {}
     forward_step = hooks['forward_step']
-
+    grad_accumulation_steps = getattr(args, 'fsdp_gradient_accumulation_steps', 1)
     while True:
         profiling_flag = (args.profiling != -1 and args.iteration >= args.profiling)
         # Forward model for one step.
@@ -627,6 +865,19 @@ def train_step(data_iterator, model, optimizer, lr_scheduler,
                     skipped_iter = 1
             else:
                 model.step()
+        elif hasattr(args, 'fsdp2') and args.fsdp2:
+            if count % grad_accumulation_steps == 0:
+                fsdp_config = getattr(args, 'fsdp2_config', {})
+                max_grad_norm = fsdp_config.get('max_grad_norm', 1.0)
+                # print(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10000))
+                # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                grad_norm = clip_grad_norm_fsdp2(model.parameters(), max_norm=max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad()
+                lr_scheduler.step()
+                complete = True
+            else:
+                complete = False
         else:
             raise ValueError('Currently, we only support training with deepspeed.')
         timers('optimizer').stop()
@@ -634,7 +885,13 @@ def train_step(data_iterator, model, optimizer, lr_scheduler,
             torch.cuda.nvtx.range_pop()
         if complete or single_step:
             break
-    additional_log_dict['grad_norm'] = model.get_global_grad_norm().item()
+    grad_name = 'grad_norm'
+    if args.deepspeed:
+        additional_log_dict[grad_name] = model.get_global_grad_norm().item()
+    elif hasattr(args, 'fsdp2') and args.fsdp2:
+        additional_log_dict[grad_name] = grad_norm
+    else:
+        additional_log_dict[grad_name] = 0.0
     lm_loss_total /= count
     metrics_total = {key: torch.tensor(-100, device=metrics_total[key].data.device) if metrics_count[key] == 0 else value / metrics_count[key] for key, value in metrics_total.items()}
     return lm_loss_total, skipped_iter, metrics_total, additional_log_dict
@@ -646,13 +903,14 @@ def backward_step(optimizer, model, loss, args, timers):
     # Backward pass.
     if args.deepspeed:
         model.backward(loss)
+    elif hasattr(args, 'fsdp2') and args.fsdp2:
+        # FSDP2 backward pass
+        loss = loss / getattr(args, 'fsdp_gradient_accumulation_steps', 1)
+        loss.backward()
     else:
-        raise ValueError('Currently, we only support training with deepspeed.')
+        raise ValueError('Currently, we only support training with deepspeed or fsdp2.')
 
-    if args.deepspeed:
-        # DeepSpeed backward propagation already addressed all reduce communication.
-        # Reset the timer to avoid breaking timer logs below.
-        timers('allreduce').reset()
+    timers('allreduce').reset()
 
     return
 
@@ -750,8 +1008,12 @@ def report_iteration_metrics(summary_writer, optimizer, lr, loss, elapsed_time, 
     for key in avg_metrics:
         log_string += ' {} {:.6E} |'.format(key, avg_metrics[key])
     if args.fp16:
-        log_string += ' loss scale {:.1f} |'.format(
-            optimizer.cur_scale if args.deepspeed else optimizer.loss_scale)
+        if args.deepspeed:
+            log_string += ' loss scale {:.1f} |'.format(optimizer.cur_scale)
+        elif hasattr(args, 'fsdp2') and args.fsdp2:
+            log_string += ' loss scale N/A (FSDP2) |'
+        else:
+            log_string += ' loss scale {:.1f} |'.format(optimizer.loss_scale)
     log_string += 'speed {:.2f} samples/(min*GPU)'.format(
         (args.gradient_accumulation_steps * args.batch_size / args.model_parallel_size / (elapsed_time / 60000.0)))
     print_rank0(log_string)

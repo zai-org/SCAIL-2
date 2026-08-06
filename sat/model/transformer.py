@@ -30,6 +30,8 @@ from sat.ops.layernorm import LayerNorm
 
 from sat.transformer_defaults import HOOKS_DEFAULT, standard_attention, split_tensor_along_last_dim
 
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
 
 class SelfAttention(torch.nn.Module):
     def __init__(self, hidden_size, num_attention_heads,
@@ -572,6 +574,7 @@ class BaseTransformer(torch.nn.Module):
     def forward(self, input_ids, position_ids, attention_mask, *,
                 output_hidden_states=False, **kw_args):
         # sanity check
+        from sat.training.deepspeed_training import _fsdp2_enabled
         assert len(input_ids.shape) >= 2
         batch_size, query_length = input_ids.shape[:2]
 
@@ -689,8 +692,9 @@ class BaseTransformer(torch.nn.Module):
                     hidden_states, output_per_layers_part, output_cross_layer, *flat_outputs = \
                     custom(l, l + chunk_length, kw_args_index, cross_layer_index)(*args, *flat_inputs)
                 else:
+                    check_fun = checkpoint if not _fsdp2_enabled else torch_checkpoint
                     hidden_states, output_per_layers_part, output_cross_layer, *flat_outputs = \
-                    checkpoint(custom(l, l + chunk_length, kw_args_index, cross_layer_index), *args, *flat_inputs)
+                    check_fun(custom(l, l + chunk_length, kw_args_index, cross_layer_index), *args, *flat_inputs)
                 
                 # recover output_per_layers_part, output_cross_layer
                 for output_this_layer in output_per_layers_part:

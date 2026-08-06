@@ -315,7 +315,8 @@ def add_data_args(parser):
     group.add_argument('--prefetch-factor', type=int, default=4, 
                        help='prefetching number of batches.')
     group.add_argument('--restart-on-stop', default=False, action='store_true')
-    group.add_argument('--fsdp-gradient-accumulation-steps', default=1, action='store_true')
+    group.add_argument('--fsdp-gradient-accumulation-steps', type=int, default=1,
+                       help='Gradient accumulation steps for FSDP2 training.')
     group.add_argument('--save-optimizer', default=False, action='store_true')
     return parser
 

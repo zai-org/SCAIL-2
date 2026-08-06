@@ -24,6 +24,9 @@ try:
 except ImportError:
     print("warning: wandb not installed")
 
+from sat.mpu.data import _build_key_size_numel_dictionaries, _check_data_types
+from sat.mpu.initialize import get_model_parallel_rank, get_model_parallel_src_rank, get_model_parallel_group, get_sequence_parallel_rank, get_sequence_parallel_src_rank, get_sequence_parallel_group, sequence_parallel_is_initialized, get_sequence_parallel_world_size, get_data_broadcast_group, get_data_broadcast_src_rank, get_data_broadcast_rank
+
 def debatch_collate(items):
     return items[0]
 
@@ -315,6 +318,8 @@ if __name__ == '__main__':
             base_config = yaml.safe_load(f)
         configs.append(base_config)
     args.log_config = configs
+    if torch.distributed.get_rank() == 0:
+        pass
 
     if args.model_type == "dit":
         Engine = diffusion_video.SATVideoDiffusionEngine
