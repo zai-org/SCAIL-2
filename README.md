@@ -1,6 +1,6 @@
 # SCAIL-2 (SAT Implementation)
 
-This branch holds the original **SAT-based** implementation of SCAIL-2 used to produce the results reported in the paper. It is preserved for reproducibility. For day-to-day inference, use the streamlined [`wan-scail2`](https://github.com/teal024/SCAIL-2/tree/wan-scail2) branch instead.
+This branch holds the original **SAT-based** implementation of SCAIL-2 used to produce the results reported in the paper. It is preserved for reproducibility. For day-to-day inference, use the streamlined [`wan-scail2`](https://github.com/zai-org/SCAIL-2/tree/wan-scail2) branch instead.
 
 ## Checkpoints
 
@@ -76,6 +76,18 @@ bash scripts/sample_sgl_14Bsc_xc_txt.sh
 ```
 
 The model is trained with **long detailed prompts**; short or empty prompts will run but produce weaker results. Sampling configurations (resolution, etc.) live in `configs/sampling/`; for custom sampling logic edit `sample_video.py`.
+
+
+## Training
+This repository supports SCAIL-2 training with DeepSpeed ZeRO-2 and FSDP2 on cached latent WebDataset shards. Build the training cache with the [`wan-scail2`](https://github.com/zai-org/SCAIL-2/tree/wan-scail2) branch first, using its `cache_scail2_wds.py` workflow; that cache script runs the target video, driving signal, reference image, and masks through the Wan VAE and writes the fields consumed by `data_video.VideoPoseLatentDataset`.
+
+```sh
+bash scripts/train_mpi_14Bsc_xc_latent_example.sh
+
+bash scripts/train_mpi_14Bsc_xc_latent_fsdp_example.sh
+```
+
+Set `SCAIL2_POSE_LATENT_TRAIN_DIR` to the cached WDS directory and `SCAIL2_INIT_CKPT` to an initial SAT checkpoint if you are fine-tuning from a local checkpoint. The example configs keep `wandb` disabled by default and use placeholder data paths.
 
 ## Acknowledgements
 

@@ -1,0 +1,86 @@
+args:
+  # DeepSpeed ZeRO-2 fine-tuning example for the shared dit_video_crossattn_sc_xc.py path.
+  # Set --load from the launch script, or edit this file for your local checkpoint.
+  lr_decay_style: cosine
+  checkpoint_activations: True
+  only_log_video_latents: False
+  model_parallel_size: 1
+  wandb: False
+  mode: finetune
+  no_load_rng: True
+  train_iters: 1000
+  eval_iters: 1
+  eval_interval: 100000
+  save: outputs/checkpoints
+  empty_cache_interval: 1
+  save_interval: 100
+  log_interval: 20
+  train_data: ["train_0"]
+  valid_data: ["valid_0"]
+  train_data_weights: [1]
+  split: 1,0,0
+  iterable_dataset: True
+  iterable_dataset_eval: True
+  num_workers: 4
+  sequence_parallel_size: 8
+  num_multi_query_heads: 8
+  force_train: True
+  experiment_name: pose-wan-14bsc-deepspeed-example
+  wandb_project_name: pose-wan-14bsc-deepspeed-example
+
+data:
+  target: data_video.IVBucketDataset
+  params:
+    batch_size: 1
+    eval_batch_size: 1
+    video_ratio: 1
+    image_size_buckets: [[64, 112], [112, 64]]
+    video_frame_batch_buckets: [[21, 1], [17, 1]]
+    image_frame_batch_buckets: [[1, 25]]
+    bucket_helper_type: pose_latent
+    modify_prompt: True
+    shuffle_buffer: 1
+    image_dataset_configs: []
+    video_dataset_configs:
+      - target: data_video.VideoPoseLatentDataset
+        params:
+          fps: 16
+          meta_names: ["caption", "duration", "fps", "optical_flow_score", "long_caption", "long_captionv3", "long_caption_v3", "aesthetic_score", "width", "height", "motion_indices", "ref_image_indices", "random_slow_play"]
+          path: ""
+          include_dirs:
+            - ${oc.env:SCAIL2_POSE_LATENT_TRAIN_DIR,examples/data/pose_latent_train}
+
+deepspeed:
+  train_micro_batch_size_per_gpu: 1
+  gradient_accumulation_steps: 3
+  steps_per_print: 50
+  gradient_clipping: 0.1
+  zero_optimization:
+    stage: 2
+    cpu_offload: false
+    contiguous_gradients: false
+    overlap_comm: true
+    reduce_scatter: true
+    reduce_bucket_size: 1000000000
+    allgather_bucket_size: 1000000000
+    load_from_fp32_weights: false
+  zero_allow_untested_optimizer: true
+  bf16:
+    enabled: True
+  fp16:
+    enabled: False
+    loss_scale: 0
+    loss_scale_window: 400
+    hysteresis: 2
+    min_loss_scale: 1
+  optimizer:
+    type: AdamW
+    params:
+      lr: 1e-5
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      weight_decay: 1e-4
+  activation_checkpointing:
+    partition_activations: false
+    contiguous_memory_optimization: false
+  wall_clock_breakdown: false
