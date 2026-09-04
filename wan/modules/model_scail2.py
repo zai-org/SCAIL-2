@@ -55,29 +55,17 @@ def rope_apply_ref(x, freqs, **kwargs):
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    # loop over samples
-    output = []
-    for i in range(x.size(0)):
-        seq_len = f * h * w
-        assert seq_len == x.size(1)
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][shift_w:shift_w+w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+    seq_len = f * h * w
+    assert seq_len == x.size(1)
+    x_i = torch.view_as_complex(x[:, :seq_len].to(torch.float64).reshape(
+        x.size(0), seq_len, n, -1, 2))
+    freqs_i = torch.cat([
+        freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
+        freqs[2][shift_w:shift_w+w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1).reshape(seq_len, 1, -1)
+    x_i = torch.view_as_real(x_i * freqs_i).flatten(3)
+    return torch.cat([x_i, x[:, seq_len:]], dim=1).float()
 
 @amp.autocast(enabled=False)
 def rope_apply_additional_ref(x, freqs, **kwargs):
@@ -99,29 +87,23 @@ def rope_apply_video(x, freqs, **kwargs):
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    # loop over samples
-    output = []
-    for i in range(x.size(0)):
-        seq_len = f * h * w
-        assert seq_len == x.size(1)
+    seq_len = f * h * w
+    assert seq_len == x.size(1)
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][shift_w:shift_w+w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
+    # precompute multipliers
+    x_i = torch.view_as_complex(x[:, :seq_len].to(torch.float64).reshape(
+        x.size(0), seq_len, n, -1, 2))
+    freqs_i = torch.cat([
+        freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
+        freqs[2][shift_w:shift_w+w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ],
+                        dim=-1).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+    # apply rotary embedding
+    x_i = torch.view_as_real(x_i * freqs_i).flatten(3)
+    x_i = torch.cat([x_i, x[:, seq_len:]], dim=1)
+    return x_i.float()
 
 @amp.autocast(enabled=False)
 def rope_apply_pose(x, freqs, **kwargs):
@@ -137,48 +119,26 @@ def rope_apply_pose(x, freqs, **kwargs):
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
-    # loop over samples
-    output = []
-    for i in range(x.size(0)):
-        seq_len = f * (h // 2) * (w // 2) # downsampled
-        assert seq_len == x.size(1)
+    seq_len = f * (h // 2) * (w // 2) # downsampled
+    assert seq_len == x.size(1)
+    x_i = torch.view_as_complex(x[:, :seq_len].to(torch.float64).reshape(
+        x.size(0), seq_len, n, -1, 2))
+    freqs_i = torch.cat([
+        freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
+        freqs[2][shift_w:shift_w+w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1) # T H W D
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][shift_w:shift_w+w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1) # T H W D
-
-        assert shift_w + w <= freqs[2].size(0), f"{shift_w + w} > {freqs[2].size(0)}"
-
-        # downsample
-        freqs_i_real = F.avg_pool2d(
-            freqs_i.real.permute(0, 3, 1, 2), kernel_size=2, stride=2
-        ).permute(
-            0, 2, 3, 1
-        )  # T H W D -> T D H W -> T D H/2 W/2 -> T H/2 W/2 D
-
-        freqs_i_imag = F.avg_pool2d(
-            freqs_i.imag.permute(0, 3, 1, 2), kernel_size=2, stride=2
-        ).permute(
-            0, 2, 3, 1
-        )  # T H W D -> T D H W -> T D H/2 W/2 -> T H/2 W/2 D
-
-        freqs_i = torch.complex(freqs_i_real, freqs_i_imag)
-
-        freqs_i = freqs_i.reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+    assert shift_w + w <= freqs[2].size(0), f"{shift_w + w} > {freqs[2].size(0)}"
+    freqs_i_real = F.avg_pool2d(
+        freqs_i.real.permute(0, 3, 1, 2), kernel_size=2, stride=2
+    ).permute(0, 2, 3, 1)
+    freqs_i_imag = F.avg_pool2d(
+        freqs_i.imag.permute(0, 3, 1, 2), kernel_size=2, stride=2
+    ).permute(0, 2, 3, 1)
+    freqs_i = torch.complex(freqs_i_real, freqs_i_imag).reshape(seq_len, 1, -1)
+    x_i = torch.view_as_real(x_i * freqs_i).flatten(3)
+    return torch.cat([x_i, x[:, seq_len:]], dim=1).float()
 
 def rope_apply_scail(x, **kwargs):
     """
