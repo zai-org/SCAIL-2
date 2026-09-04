@@ -59,6 +59,47 @@ def flash_attention(
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
+    use_fa3 = (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE
+    if version is not None and version == 3 and not FLASH_ATTN_3_AVAILABLE:
+        warnings.warn(
+            'Flash attention 3 is not available, use flash attention 2 instead.'
+        )
+
+    # Uniform batches do not need packing or cumulative sequence lengths.
+    if q_lens is None and k_lens is None:
+        v = half(v)
+        q = half(q).to(v.dtype)
+        k = half(k).to(v.dtype)
+
+        if q_scale is not None:
+            q = q * q_scale
+
+        if use_fa3:
+            # Note: dropout_p and window_size are not supported in FA3 now.
+            x = flash_attn_interface.flash_attn_func(
+                q=q,
+                k=k,
+                v=v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                deterministic=deterministic,
+            )
+            if isinstance(x, tuple):
+                x = x[0]
+        else:
+            assert FLASH_ATTN_2_AVAILABLE
+            x = flash_attn.flash_attn_func(
+                q=q,
+                k=k,
+                v=v,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic,
+            )
+        return x.type(out_dtype)
+
     # preprocess query
     if q_lens is None:
         q = half(q.flatten(0, 1))
@@ -85,13 +126,8 @@ def flash_attention(
     if q_scale is not None:
         q = q * q_scale
 
-    if version is not None and version == 3 and not FLASH_ATTN_3_AVAILABLE:
-        warnings.warn(
-            'Flash attention 3 is not available, use flash attention 2 instead.'
-        )
-
     # apply attention
-    if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
+    if use_fa3:
         # Note: dropout_p, window_size are not supported in FA3 now.
         x = flash_attn_interface.flash_attn_varlen_func(
             q=q,
